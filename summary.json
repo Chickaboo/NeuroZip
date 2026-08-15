@@ -1,0 +1,9 @@
+{
+  "best_checkpoint": "/kaggle/working/neurozip-v0-wikitext103/artifacts/best.pt",
+  "best_validation_bpb": 1.841276502441036,
+  "last_checkpoint": "/kaggle/working/neurozip-v0-wikitext103/artifacts/last.pt",
+  "model_id": "gru-v0-33d0736a26d07c2a",
+  "parameter_count": 2955776,
+  "total_steps": 2000,
+  "wall_time_seconds": 1439.546732009
+}

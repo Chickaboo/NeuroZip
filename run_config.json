@@ -1,0 +1,32 @@
+{
+  "model_config": {
+    "architecture": "byte-gru-v0",
+    "bos_id": 256,
+    "embedding_dim": 256,
+    "hidden_size": 512,
+    "num_layers": 2,
+    "output_size": 256
+  },
+  "train_config": {
+    "batch_size": 32,
+    "device": "cuda",
+    "embedding_dim": 256,
+    "eval_every": 250,
+    "gradient_clip": 1.0,
+    "hidden_size": 512,
+    "learning_rate": 0.0003,
+    "num_layers": 2,
+    "output_dir": "/kaggle/working/neurozip-v0-wikitext103/artifacts",
+    "parameter_count": 2955776,
+    "resolved_device": "cuda",
+    "seed": 20260814,
+    "sequence_length": 2048,
+    "steps": 2000,
+    "train_bytes": 52428800,
+    "train_path": "/kaggle/working/neurozip-v0-wikitext103/data/train.raw",
+    "valid_path": "/kaggle/working/neurozip-v0-wikitext103/data/validation.raw",
+    "validation_bytes": 1146846,
+    "validation_eval_bytes": 5242880,
+    "weight_decay": 0.01
+  }
+}

@@ -1,0 +1,116 @@
+{
+  "experiment": "neurozip-byte-architecture-sweep-v1",
+  "description": "Matched-budget raw-byte neural lossless compression comparison.",
+  "dataset": {
+    "train_bytes": 52428800,
+    "validation_bytes": 5242880,
+    "seed": 20260814,
+    "heldout_benchmark_bytes": 262144
+  },
+  "representation": {
+    "alphabet": "raw bytes",
+    "vocabulary_size": 256,
+    "bos_id": 256,
+    "sequence_length": 2048
+  },
+  "training": {
+    "steps": 2000,
+    "batch_size_per_gpu": 32,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.01,
+    "gradient_clip": 1.0,
+    "eval_every": 250,
+    "validation_eval_bytes": 5242880,
+    "device": "cuda"
+  },
+  "coding": {
+    "cdf_bits": 20,
+    "coder": "NeuroZip V0 integer range coder"
+  },
+  "matching": {
+    "target_parameter_count": 3000000,
+    "note": "Small deviations are reported rather than hidden; all models share the same byte head and embedding budget."
+  },
+  "architectures": [
+    {
+      "name": "gru",
+      "label": "GRU baseline",
+      "architecture": "gru",
+      "args": {
+        "embedding_dim": 256,
+        "hidden_size": 512,
+        "num_layers": 2
+      }
+    },
+    {
+      "name": "lstm",
+      "label": "LSTM control",
+      "architecture": "lstm",
+      "args": {
+        "embedding_dim": 256,
+        "hidden_size": 448,
+        "num_layers": 2
+      }
+    },
+    {
+      "name": "transformer",
+      "label": "small causal Transformer",
+      "architecture": "transformer",
+      "args": {
+        "model_dim": 256,
+        "num_layers": 4,
+        "num_heads": 8,
+        "ff_dim": 896,
+        "context_length": 2048
+      }
+    },
+    {
+      "name": "mamba",
+      "label": "Mamba-Lite diagonal selective SSM",
+      "architecture": "mamba",
+      "args": {
+        "model_dim": 256,
+        "inner_dim": 512,
+        "num_layers": 4,
+        "conv_kernel": 4,
+        "scan_chunk_size": 32
+      }
+    },
+    {
+      "name": "griffin",
+      "label": "Griffin-Lite local conv + gated recurrence",
+      "architecture": "griffin",
+      "args": {
+        "model_dim": 256,
+        "inner_dim": 384,
+        "num_layers": 7,
+        "conv_kernel": 4,
+        "scan_chunk_size": 32
+      }
+    },
+    {
+      "name": "gated-deltanet",
+      "label": "Gated DeltaNet-Lite diagonal delta rule",
+      "architecture": "gated-deltanet",
+      "args": {
+        "model_dim": 256,
+        "num_heads": 8,
+        "num_layers": 7,
+        "value_multiplier": 1,
+        "scan_chunk_size": 32
+      }
+    },
+    {
+      "name": "gated-deltanet2",
+      "label": "Gated DeltaNet-2-Lite decoupled erase/write rule",
+      "architecture": "gated-deltanet2",
+      "args": {
+        "model_dim": 256,
+        "num_heads": 8,
+        "num_layers": 7,
+        "value_multiplier": 1,
+        "scan_chunk_size": 32
+      }
+    }
+  ]
+}

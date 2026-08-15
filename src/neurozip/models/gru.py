@@ -70,6 +70,21 @@ class ByteGRU(nn.Module if nn is not None else object):
         sequence, hidden = self.gru(embedded, hidden)
         return self.output(sequence), hidden
 
+    def init_state(self, batch_size: int, device: str | None = None) -> None:
+        """Return the streaming state used by the generic predictor."""
+
+        # ``nn.GRU`` treats ``None`` as an all-zero initial state.  Keeping the
+        # state implicit preserves the exact behaviour of old V0 checkpoints.
+        return None
+
+    def step(self, input_ids: Any, state: Any = None) -> tuple[Any, Any]:
+        """Run one causal token step for the shared predictor interface."""
+
+        if input_ids.ndim == 1:
+            input_ids = input_ids.unsqueeze(1)
+        logits, state = self.forward(input_ids, state)
+        return logits[:, 0], state
+
 
 def model_id_from_state(model_config: dict[str, Any], state_dict: dict[str, Any]) -> str:
     """Create a stable identifier from canonical config and tensor bytes."""
@@ -87,7 +102,7 @@ def model_id_from_state(model_config: dict[str, Any], state_dict: dict[str, Any]
         try:
             digest.update(tensor.numpy().tobytes())
         except RuntimeError:
-            digest.update(bytes(tensor.view(torch_module.uint8).tolist()))
+            digest.update(bytes(tensor.view(torch_module.uint8).reshape(-1).tolist()))
     return f"gru-v0-{digest.hexdigest()[:16]}"
 
 

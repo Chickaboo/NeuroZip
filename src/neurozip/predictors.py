@@ -10,7 +10,7 @@ from __future__ import annotations
 from array import array
 from typing import Any
 
-from .coding.cdf import DEFAULT_CDF_BITS, cdf_from_probs, uniform_cdf
+from .coding.cdf import DEFAULT_CDF_BITS, cdf_from_probs, cdf_from_torch_logits, uniform_cdf
 
 
 class UniformPredictor:
@@ -75,8 +75,67 @@ class AdaptiveNgramPredictor:
 
 
 def load_gru_predictor(model_path: str, *, device: str = "cpu") -> Any:
-    """Load a trained GRU predictor without importing PyTorch for uniform use."""
+    """Load a trained neural predictor without importing PyTorch for controls."""
 
-    from .models.gru import GRUPredictor
+    return load_model_predictor(model_path, device=device)
 
-    return GRUPredictor.from_checkpoint(model_path, device=device)
+
+class NeuralPredictor:
+    """Streaming adapter shared by every self-describing neural checkpoint."""
+
+    def __init__(self, model: Any, *, model_id: str, device: str = "cpu", model_config: dict[str, Any] | None = None) -> None:
+        try:
+            import torch
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError("PyTorch is required for a neural predictor") from exc
+        self._torch = torch
+        self.model = model.to(device)
+        self.model.eval()
+        self.model_id = model_id
+        self.device = device
+        self.model_config = model_config or getattr(model, "model_config", {})
+        self._state: Any = None
+        self._logits: Any = None
+        self.reset()
+
+    @classmethod
+    def from_checkpoint(cls, path: str, *, device: str = "cpu") -> "NeuralPredictor":
+        from .models.registry import load_checkpoint, model_id_from_state
+
+        model, checkpoint = load_checkpoint(path, device=device)
+        model_id = checkpoint.get("model_id") or model_id_from_state(
+            checkpoint["model_config"], checkpoint["model_state_dict"]
+        )
+        return cls(
+            model,
+            model_id=model_id,
+            device=device,
+            model_config=checkpoint["model_config"],
+        )
+
+    def _step(self, token: int) -> None:
+        input_ids = self._torch.tensor([token], dtype=self._torch.long, device=self.device)
+        with self._torch.inference_mode():
+            logits, self._state = self.model.step(input_ids, self._state)
+        self._logits = logits[0].detach()
+
+    def reset(self) -> None:
+        self._state = self.model.init_state(1, self.device)
+        self._logits = None
+        self._step(int(self.model.bos_id))
+
+    def cdf(self, cdf_bits: int = DEFAULT_CDF_BITS) -> tuple[int, ...]:
+        if self._logits is None:
+            raise RuntimeError("neural predictor must be reset before requesting a CDF")
+        return cdf_from_torch_logits(self._logits, total=1 << cdf_bits)
+
+    def update(self, symbol: int) -> None:
+        if not 0 <= symbol < self.model.output_size:
+            raise ValueError("neural predictor received a non-byte symbol")
+        self._step(symbol)
+
+
+def load_model_predictor(model_path: str, *, device: str = "cpu") -> NeuralPredictor:
+    """Load GRU or any architecture checkpoint through one codec adapter."""
+
+    return NeuralPredictor.from_checkpoint(model_path, device=device)

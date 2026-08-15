@@ -1,7 +1,7 @@
 # NeuroZip: research and design plan
 
-Status: design baseline for the V0 implementation; see the repository source
-and Kaggle notebook for the first runnable system.
+Status: design baseline for the V0 implementation; see the repository source,
+architecture sweep configuration, and Kaggle notebook for the runnable system.
 
 Decision date: 2026-08-14
 
@@ -112,6 +112,17 @@ from the beginning to the end of each file and resets at the file boundary.
 The interface will expose `predict(state, previous_byte)` so the predictor can
 later be replaced by a Transformer, SSM, patch model, or mixer without changing
 the coder or file-format code.
+
+The matched architecture experiment in
+[`configs/architecture_sweep_wikitext103_kaggle.json`](../configs/architecture_sweep_wikitext103_kaggle.json)
+keeps this GRU as the baseline and tests an LSTM control, a causal Transformer,
+Mamba-Lite, Griffin-Lite, and diagonal Gated DeltaNet/Gated DeltaNet-2-Lite
+variants. Each model exposes the same one-byte streaming state interface and is
+benchmarked by
+[`neurozip.experiments.architecture_benchmark`](../src/neurozip/experiments/architecture_benchmark.py)
+through the real CDF/range-coder path. The Lite names are deliberate: these are
+portable reference variants, not optimized reproductions of every research
+kernel or gating detail.
 
 ## 3. Why GRU bytes are V0
 

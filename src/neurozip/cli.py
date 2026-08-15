@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .codec import compress_file, decompress_file
 from .file_format import parse_container
-from .predictors import AdaptiveNgramPredictor, UniformPredictor, load_gru_predictor
+from .predictors import AdaptiveNgramPredictor, UniformPredictor, load_model_predictor
 
 
 def _predictor(model: str | None, predictor: str | None = None, *, device: str = "cpu"):
@@ -23,7 +23,7 @@ def _predictor(model: str | None, predictor: str | None = None, *, device: str =
         raise SystemExit("--predictor gru requires --model PATH")
     if model is None:
         return UniformPredictor()
-    return load_gru_predictor(model, device=device)
+    return load_model_predictor(model, device=device)
 
 
 def _add_predictor_args(parser: argparse.ArgumentParser) -> None:
@@ -130,13 +130,14 @@ def _benchmark(args: argparse.Namespace) -> None:
 
 
 def _model_info(args: argparse.Namespace) -> None:
-    predictor = load_gru_predictor(args.model, device="cpu")
-    model = predictor.model
+    from .models.registry import load_checkpoint
+
+    model, checkpoint = load_checkpoint(args.model, device="cpu")
     parameters = sum(parameter.numel() for parameter in model.parameters())
     print(
         json.dumps(
             {
-                "model_id": predictor.model_id,
+                "model_id": checkpoint.get("model_id"),
                 "model_config": model.model_config,
                 "parameters": parameters,
                 "checkpoint_bytes": Path(args.model).stat().st_size,
