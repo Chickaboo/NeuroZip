@@ -1,8 +1,14 @@
 # NeuroZip: research and design plan
 
-Status: research/design phase only; no main compressor has been implemented yet.
+Status: design baseline for the V0 implementation; see the repository source
+and Kaggle notebook for the first runnable system.
 
 Decision date: 2026-08-14
+
+Implementation note: the first runnable training pilot requested after this
+design uses a deterministic 50 MiB raw WikiText-103 window plus a 5 MiB
+validation window. This is a deliberately small V0 pipeline test; the FineWeb
+mixture experiments described below remain the next data-study phase.
 
 ## Executive decision
 
@@ -440,8 +446,9 @@ nulls, truncation, corruption, and unknown model IDs. This gate can falsify
 the file-format/coder assumptions without ML dependencies.
 
 **Gate B: learned shared predictor.** Train the 2x512 GRU on a deterministic
-100M-byte M2 stream, with a 10M-byte validation stream and a fixed seed. On the
-frozen suite, compare:
+50 MiB raw WikiText-103 training window, with a 5 MiB validation window and a
+fixed seed. The broader M2 mixture remains the next controlled data experiment.
+On the frozen suite, compare:
 
 - order-2 and order-4 byte predictors;
 - the GRU's float cross entropy, quantized-CDF estimate, and actual range bits;

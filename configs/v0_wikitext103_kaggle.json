@@ -1,0 +1,25 @@
+{
+  "dataset": {
+    "train_bytes": 52428800,
+    "validation_bytes": 5242880,
+    "seed": 20260814
+  },
+  "model": {
+    "architecture": "byte-gru-v0",
+    "embedding_dim": 256,
+    "hidden_size": 512,
+    "num_layers": 2,
+    "cdf_bits": 20
+  },
+  "training": {
+    "steps": 2000,
+    "batch_size": 32,
+    "sequence_length": 2048,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.01,
+    "gradient_clip": 1.0,
+    "eval_every": 250,
+    "validation_eval_bytes": 5242880,
+    "device": "cuda"
+  }
+}
