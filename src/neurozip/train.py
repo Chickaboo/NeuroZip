@@ -161,12 +161,50 @@ def sample_batch(data, *, batch_size: int, sequence_length: int, generator, devi
     return inputs.to(device), targets.to(device)
 
 
-def evaluate(model, data, *, sequence_length: int, max_bytes: int, device: str) -> dict[str, float]:
+def _resolve_amp_mode(requested: str, device: str) -> str:
+    mode = str(requested or "off").lower()
+    if mode == "auto":
+        mode = "fp16" if device.startswith("cuda") else "off"
+    if mode not in {"off", "fp16", "bf16"}:
+        raise ValueError("amp must be one of: off, auto, fp16, bf16")
+    if mode == "fp16" and not device.startswith("cuda"):
+        raise ValueError("fp16 AMP requires a CUDA device")
+    return mode
+
+
+def _autocast_context(torch, *, device: str, amp_mode: str):
+    if amp_mode == "auto":
+        amp_mode = "fp16" if device.startswith("cuda") else "off"
+    if amp_mode == "off":
+        return nullcontext()
+    dtype = torch.float16 if amp_mode == "fp16" else torch.bfloat16
+    return torch.autocast(device_type="cuda" if device.startswith("cuda") else "cpu", dtype=dtype)
+
+
+def _make_grad_scaler(torch, *, device: str, amp_mode: str):
+    enabled = amp_mode == "fp16" and device.startswith("cuda")
+    if not enabled:
+        return None
+    try:
+        return torch.amp.GradScaler("cuda", enabled=True)
+    except (AttributeError, TypeError):  # pragma: no cover - older torch fallback.
+        return torch.cuda.amp.GradScaler(enabled=True)
+
+
+def evaluate(
+    model,
+    data,
+    *,
+    sequence_length: int,
+    max_bytes: int,
+    device: str,
+    amp_mode: str = "off",
+) -> dict[str, float]:
     torch, F = _require_torch()
     model.eval()
     total_loss = 0.0
     total_bytes = 0
-    with torch.inference_mode():
+    with torch.inference_mode(), _autocast_context(torch, device=device, amp_mode=amp_mode):
         limit = min(len(data), max_bytes)
         start = 0
         while start < limit:
@@ -182,7 +220,7 @@ def evaluate(model, data, *, sequence_length: int, max_bytes: int, device: str) 
             logits, _ = model(inputs)
             total_loss += float(
                 F.cross_entropy(
-                    logits.reshape(-1, model.output_size),
+                    logits.float().reshape(-1, model.output_size),
                     targets.reshape(-1),
                     reduction="sum",
                 ).item()
@@ -231,6 +269,7 @@ def save_checkpoint(
     step: int,
     metrics: dict[str, Any],
     optimizer=None,
+    extra_state: dict[str, Any] | None = None,
 ) -> str:
     torch, _ = _require_torch()
     from .models.registry import model_id_from_state
@@ -252,8 +291,12 @@ def save_checkpoint(
     }
     if optimizer is not None:
         payload["optimizer_state_dict"] = optimizer.state_dict()
+    if extra_state is not None:
+        payload["resume_state"] = extra_state
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, path)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
     return model_id
 
 
@@ -316,6 +359,61 @@ def build_model_from_args(args: argparse.Namespace):
     raise ValueError(f"unsupported architecture: {args.architecture}")
 
 
+def _load_torch_checkpoint(torch, path: Path) -> dict[str, Any]:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:  # pragma: no cover - older torch fallback.
+        return torch.load(path, map_location="cpu")
+
+
+def _read_metric_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                # A process killed while appending should not make a later
+                # resume impossible; the last complete JSON row is enough.
+                continue
+    return rows
+
+
+def _distributed_generator_states(generator, *, context: DistributedContext):
+    torch, _ = _require_torch()
+    state = generator.get_state().cpu()
+    if not context.enabled:
+        return [state]
+    states: list[Any] = [None] * context.world_size
+    torch.distributed.all_gather_object(states, state)
+    return states
+
+
+def _optimizer_to_device(optimizer, *, device: str) -> None:
+    torch, _ = _require_torch()
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                state[key] = value.to(device)
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def _clear_training_artifacts(output_dir: Path) -> None:
+    for name in ("best.pt", "last.pt", "metrics.jsonl", "summary.json", "run_config.json"):
+        path = output_dir / name
+        if path.exists():
+            path.unlink()
+    for path in output_dir.glob(".*.pt.tmp"):
+        path.unlink()
+
+
 def _train_impl(
     args: argparse.Namespace, *, context: DistributedContext
 ) -> dict[str, Any] | None:
@@ -324,12 +422,71 @@ def _train_impl(
         raise ValueError("steps must be positive")
     if args.batch_size <= 0 or args.sequence_length <= 0:
         raise ValueError("batch size and sequence length must be positive")
+    accumulation_steps = int(getattr(args, "gradient_accumulation_steps", 1))
+    if accumulation_steps <= 0:
+        raise ValueError("gradient accumulation steps must be positive")
     device = context.device
+    amp_mode = _resolve_amp_mode(getattr(args, "amp", "off"), device)
+    resume_requested = bool(getattr(args, "resume", False))
+    restart_requested = bool(getattr(args, "restart", False))
+    if resume_requested and restart_requested:
+        raise ValueError("--resume and --restart are mutually exclusive")
+
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if restart_requested and context.is_main:
+        _clear_training_artifacts(output_dir)
+    distributed_barrier(context)
 
     seed_everything(args.seed)
     train_data = load_byte_tensor(args.train_path)
     valid_data = load_byte_tensor(args.valid_path)
     model = build_model_from_args(args).to(device)
+    model_config = model.model_config
+
+    resume_path: Path | None = None
+    resume_checkpoint: dict[str, Any] | None = None
+    if resume_requested:
+        for candidate in (output_dir / "last.pt", output_dir / "best.pt"):
+            if candidate.exists():
+                resume_path = candidate
+                try:
+                    resume_checkpoint = _load_torch_checkpoint(torch, candidate)
+                except Exception as exc:
+                    raise RuntimeError(f"could not load resume checkpoint {candidate}: {exc}") from exc
+                break
+    if resume_checkpoint is not None:
+        if resume_checkpoint.get("model_config") != model_config:
+            raise RuntimeError(
+                "resume checkpoint model configuration does not match the requested architecture"
+            )
+        model.load_state_dict(resume_checkpoint["model_state_dict"])
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    scaler = _make_grad_scaler(torch, device=device, amp_mode=amp_mode)
+    resume_state = (resume_checkpoint or {}).get("resume_state") or {}
+    if resume_checkpoint is not None and resume_checkpoint.get("optimizer_state_dict") is not None:
+        optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+        _optimizer_to_device(optimizer, device=device)
+    if scaler is not None and resume_state.get("scaler_state_dict"):
+        scaler.load_state_dict(resume_state["scaler_state_dict"])
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(args.seed + 1_000_003 * context.rank)
+    generator_states = resume_state.get("generator_states")
+    if generator_states is None and resume_state.get("generator_state") is not None:
+        generator_states = [resume_state["generator_state"]]
+    if generator_states:
+        state_index = min(context.rank, len(generator_states) - 1)
+        generator.set_state(generator_states[state_index].cpu())
+
+    best_model_id = resume_state.get("best_model_id")
+    if best_model_id is None and (output_dir / "best.pt").exists():
+        try:
+            best_model_id = _load_torch_checkpoint(torch, output_dir / "best.pt").get("model_id")
+        except Exception:
+            best_model_id = None
+
     train_model = model
     if context.enabled:
         ddp_kwargs: dict[str, Any] = {}
@@ -339,14 +496,8 @@ def _train_impl(
                 "output_device": context.local_rank,
             }
         train_model = torch.nn.parallel.DistributedDataParallel(model, **ddp_kwargs)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(args.seed + 1_000_003 * context.rank)
-    output_dir = args.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
 
-    model_config = model.model_config
-    train_config = {}
+    train_config: dict[str, Any] = {}
     for key, value in vars(args).items():
         if key == "func":
             continue
@@ -356,53 +507,90 @@ def _train_impl(
     train_config["rank"] = context.rank
     train_config["world_size"] = context.world_size
     train_config["local_rank"] = context.local_rank
-    train_config["effective_batch_size"] = args.batch_size * context.world_size
+    train_config["batch_size_per_gpu"] = args.batch_size
+    train_config["gradient_accumulation_steps"] = accumulation_steps
+    train_config["effective_batch_size"] = args.batch_size * accumulation_steps * context.world_size
+    train_config["amp"] = amp_mode
     train_config["train_bytes"] = len(train_data)
     train_config["validation_bytes"] = len(valid_data)
     train_config["parameter_count"] = parameter_count(model)
     train_config["architecture"] = args.architecture
     train_config["model_config"] = model_config
+    train_config["training_bytes_budget"] = (
+        args.steps * args.batch_size * accumulation_steps * args.sequence_length * context.world_size
+    )
+    if resume_path is not None:
+        train_config["resumed_from"] = str(resume_path)
+        train_config["resumed_from_step"] = int((resume_checkpoint or {}).get("step", 0))
     if context.is_main:
-        (output_dir / "run_config.json").write_text(
-            json.dumps(
-                {"model_config": model_config, "train_config": train_config},
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
+        _atomic_write_json(output_dir / "run_config.json", {"model_config": model_config, "train_config": train_config})
+    distributed_barrier(context)
 
     metrics_path = output_dir / "metrics.jsonl"
-    best_bpb = float("inf")
-    best_model_id = None
-    last_metrics: dict[str, Any] | None = None
-    started = time.perf_counter()
+    metric_rows = _read_metric_rows(metrics_path)
+    last_metrics: dict[str, Any] | None = metric_rows[-1] if metric_rows else None
+    row_best_bpb = min(
+        (float(row["validation_bpb"]) for row in metric_rows if row.get("validation_bpb") is not None),
+        default=float("inf"),
+    )
+    saved_best_bpb = resume_state.get("best_validation_bpb")
+    best_bpb = float(saved_best_bpb) if saved_best_bpb is not None else row_best_bpb
+    if not math.isfinite(best_bpb):
+        checkpoint_metrics = (resume_checkpoint or {}).get("metrics") or {}
+        checkpoint_bpb = checkpoint_metrics.get("validation_bpb")
+        best_bpb = float(checkpoint_bpb) if checkpoint_bpb is not None else float("inf")
+    elapsed_offset = float(resume_state.get("elapsed_seconds", 0.0))
+    start_step = int((resume_checkpoint or {}).get("step", 0)) + 1
+    started = time.perf_counter() - elapsed_offset
     if device.startswith("cuda"):
         torch.cuda.reset_peak_memory_stats(device)
-    metrics_context = metrics_path.open("w", encoding="utf-8") if context.is_main else nullcontext()
+
+    metrics_mode = "a" if resume_checkpoint is not None and metrics_path.exists() else "w"
+    metrics_context = metrics_path.open(metrics_mode, encoding="utf-8") if context.is_main else nullcontext()
     with metrics_context as metrics_file:
-        for step in range(1, args.steps + 1):
-            inputs, targets = sample_batch(
-                train_data,
-                batch_size=args.batch_size,
-                sequence_length=args.sequence_length,
-                generator=generator,
-                device=device,
-            )
+        for step in range(start_step, args.steps + 1):
             optimizer.zero_grad(set_to_none=True)
-            logits, _ = train_model(inputs)
-            loss = F.cross_entropy(
-                logits.reshape(-1, model.output_size), targets.reshape(-1), reduction="mean"
-            )
-            loss.backward()
+            accumulated_loss = 0.0
+            for micro_step in range(accumulation_steps):
+                inputs, targets = sample_batch(
+                    train_data,
+                    batch_size=args.batch_size,
+                    sequence_length=args.sequence_length,
+                    generator=generator,
+                    device=device,
+                )
+                if context.enabled and micro_step < accumulation_steps - 1:
+                    sync_context = train_model.no_sync()
+                else:
+                    sync_context = nullcontext()
+                with sync_context:
+                    with _autocast_context(torch, device=device, amp_mode=amp_mode):
+                        logits, _ = train_model(inputs)
+                        micro_loss = F.cross_entropy(
+                            logits.float().reshape(-1, model.output_size),
+                            targets.reshape(-1),
+                            reduction="mean",
+                        )
+                    accumulated_loss += float(micro_loss.detach().item())
+                    scaled_loss = micro_loss / accumulation_steps
+                    if scaler is not None:
+                        scaler.scale(scaled_loss).backward()
+                    else:
+                        scaled_loss.backward()
+
+            if scaler is not None:
+                scaler.unscale_(optimizer)
             if args.gradient_clip is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip)
-            optimizer.step()
+            if scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
 
-            should_log = step == 1 or step % args.eval_every == 0 or step == args.steps
+            should_log = step == start_step or step % args.eval_every == 0 or step == args.steps
             if should_log:
-                train_loss = distributed_mean(float(loss.detach().item()), context=context)
+                train_loss = distributed_mean(accumulated_loss / accumulation_steps, context=context)
                 if context.is_main:
                     validation = evaluate(
                         model,
@@ -410,6 +598,7 @@ def _train_impl(
                         sequence_length=args.sequence_length,
                         max_bytes=args.validation_eval_bytes,
                         device=device,
+                        amp_mode=amp_mode,
                     )
                     row = {
                         "step": step,
@@ -422,17 +611,9 @@ def _train_impl(
                     last_metrics = row
                     metrics_file.write(json.dumps(row, sort_keys=True) + "\n")
                     metrics_file.flush()
-                    print(json.dumps(row, sort_keys=True))
-
-                    model_id = save_checkpoint(
-                        output_dir / "last.pt",
-                        model=model,
-                        model_config=model_config,
-                        train_config=train_config,
-                        step=step,
-                        metrics=row,
-                        optimizer=optimizer,
-                    )
+                generator_states = _distributed_generator_states(generator, context=context)
+                if context.is_main:
+                    assert last_metrics is not None
                     if validation["validation_bpb"] < best_bpb:
                         best_bpb = validation["validation_bpb"]
                         best_model_id = save_checkpoint(
@@ -441,9 +622,30 @@ def _train_impl(
                             model_config=model_config,
                             train_config=train_config,
                             step=step,
-                            metrics=row,
+                            metrics=last_metrics,
                         )
                         print(json.dumps({"best_checkpoint": str(output_dir / "best.pt"), "model_id": best_model_id}))
+                    resume_payload = {
+                        "best_validation_bpb": best_bpb,
+                        "best_model_id": best_model_id,
+                        "elapsed_seconds": last_metrics["elapsed_seconds"],
+                        "generator_states": generator_states,
+                        "gradient_accumulation_steps": accumulation_steps,
+                        "amp": amp_mode,
+                    }
+                    if scaler is not None:
+                        resume_payload["scaler_state_dict"] = scaler.state_dict()
+                    save_checkpoint(
+                        output_dir / "last.pt",
+                        model=model,
+                        model_config=model_config,
+                        train_config=train_config,
+                        step=step,
+                        metrics=last_metrics,
+                        optimizer=optimizer,
+                        extra_state=resume_payload,
+                    )
+                    print(json.dumps(last_metrics, sort_keys=True))
                 distributed_barrier(context)
 
     elapsed_seconds = time.perf_counter() - started
@@ -454,26 +656,31 @@ def _train_impl(
             int(torch.cuda.max_memory_allocated(device)), context=context
         )
     peak_cpu_memory = process_max_rss_bytes()
-    training_bytes = args.steps * args.batch_size * args.sequence_length * context.world_size
+    training_bytes = (
+        args.steps * args.batch_size * accumulation_steps * args.sequence_length * context.world_size
+    )
     summary = {
         "best_checkpoint": str(output_dir / "best.pt"),
         "last_checkpoint": str(output_dir / "last.pt"),
-        "best_validation_bpb": best_bpb,
+        "best_validation_bpb": best_bpb if math.isfinite(best_bpb) else None,
         "model_id": best_model_id,
         "parameter_count": parameter_count(model),
         "total_steps": args.steps,
+        "completed_steps": args.steps if start_step <= args.steps else min(start_step - 1, args.steps),
         "wall_time_seconds": elapsed_seconds,
         "training_bytes": training_bytes,
         "training_bytes_per_second": training_bytes / elapsed_seconds if elapsed_seconds else None,
         "steps_per_second": args.steps / elapsed_seconds if elapsed_seconds else None,
+        "batch_size_per_gpu": args.batch_size,
+        "gradient_accumulation_steps": accumulation_steps,
+        "effective_batch_size": args.batch_size * accumulation_steps * context.world_size,
+        "amp": amp_mode,
         "peak_gpu_memory_bytes": peak_gpu_memory,
         "peak_cpu_memory_bytes": peak_cpu_memory,
         "last_metrics": last_metrics,
     }
     if context.is_main:
-        (output_dir / "summary.json").write_text(
-            json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
+        _atomic_write_json(output_dir / "summary.json", summary)
     distributed_barrier(context)
     return summary if context.is_main else None
 
@@ -505,10 +712,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--gradient-clip", type=float, default=1.0)
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=1,
+        help="microbatches per optimizer step; effective batch is batch-size * this * world-size",
+    )
+    parser.add_argument(
+        "--amp",
+        choices=["off", "auto", "fp16", "bf16"],
+        default="off",
+        help="optional autocast mode; fp16 uses CUDA GradScaler",
+    )
     parser.add_argument("--eval-every", type=int, default=250)
     parser.add_argument("--validation-eval-bytes", type=int, default=5 * 1024 * 1024)
     parser.add_argument("--seed", type=int, default=20260814)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume from output-dir/last.pt, or best.pt when last.pt is unavailable",
+    )
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="remove only this run's checkpoints and metrics before starting fresh",
+    )
     parser.add_argument(
         "--local-rank",
         "--local_rank",

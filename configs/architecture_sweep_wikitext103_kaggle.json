@@ -19,6 +19,15 @@
     "learning_rate": 0.0003,
     "weight_decay": 0.01,
     "gradient_clip": 1.0,
+    "gradient_accumulation_steps": 1,
+    "amp": "off",
+    "architecture_overrides": {
+      "transformer": {
+        "batch_size_per_gpu": 4,
+        "gradient_accumulation_steps": 8,
+        "amp": "fp16"
+      }
+    },
     "eval_every": 250,
     "validation_eval_bytes": 5242880,
     "device": "cuda"

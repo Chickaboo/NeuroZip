@@ -153,17 +153,116 @@ class CausalSelfAttention(nn.Module):
         batch, _, time, _ = tensor.shape
         return tensor.transpose(1, 2).contiguous().view(batch, time, self.model_dim)
 
+    @staticmethod
+    def _chunked_attention(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        is_causal: bool,
+    ) -> torch.Tensor:
+        """Memory-bounded attention fallback for older/unsupported runtimes.
+
+        The normal path uses PyTorch's scaled-dot-product attention kernels.
+        This fallback deliberately computes a small number of query rows at a
+        time so a CUDA runtime without an efficient SDPA kernel does not
+        materialize the full ``[batch, heads, time, time]`` score matrix.
+        """
+
+        query_length = query.shape[2]
+        key_length = key.shape[2]
+        query_chunk_size = 128
+        scale = query.shape[-1] ** -0.5
+        key_positions = torch.arange(key_length, device=query.device)
+        outputs: list[torch.Tensor] = []
+        for start in range(0, query_length, query_chunk_size):
+            stop = min(start + query_chunk_size, query_length)
+            query_chunk = query[:, :, start:stop]
+            query_positions = torch.arange(start, stop, device=query.device)
+
+            def attention_chunk(
+                chunk_query: torch.Tensor,
+                chunk_key: torch.Tensor,
+                chunk_value: torch.Tensor,
+                positions: torch.Tensor,
+            ) -> torch.Tensor:
+                scores = torch.matmul(chunk_query, chunk_key.transpose(-2, -1)) * scale
+                if is_causal:
+                    future = key_positions.view(1, 1, 1, key_length) > positions.view(1, 1, -1, 1)
+                    scores = scores.masked_fill(future, torch.finfo(scores.dtype).min)
+                weights = torch.softmax(scores, dim=-1)
+                return torch.matmul(weights, chunk_value)
+
+            if torch.is_grad_enabled() and (
+                query_chunk.requires_grad or key.requires_grad or value.requires_grad
+            ):
+                from torch.utils.checkpoint import checkpoint
+
+                outputs.append(
+                    checkpoint(
+                        attention_chunk,
+                        query_chunk,
+                        key,
+                        value,
+                        query_positions,
+                        use_reentrant=False,
+                    )
+                )
+            else:
+                outputs.append(attention_chunk(query_chunk, key, value, query_positions))
+        return torch.cat(outputs, dim=2)
+
+    @classmethod
+    def _scaled_dot_product_attention(
+        cls,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        is_causal: bool,
+    ) -> torch.Tensor:
+        """Prefer flash/memory-efficient SDPA, then use a chunked fallback."""
+
+        sdpa = getattr(F, "scaled_dot_product_attention", None)
+        if sdpa is None:
+            return cls._chunked_attention(query, key, value, is_causal=is_causal)
+
+        if not query.is_cuda:
+            return sdpa(query, key, value, is_causal=is_causal)
+
+        # PyTorch 2.2+ exposes a backend selector.  Do not allow the CUDA
+        # math backend here: it recreates the quadratic score tensor that
+        # caused the original 2048-token Transformer run to OOM.
+        try:
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+
+            backend_names = ("FLASH_ATTENTION", "EFFICIENT_ATTENTION", "CUDNN_ATTENTION")
+            backends = [getattr(SDPBackend, name) for name in backend_names if hasattr(SDPBackend, name)]
+            if backends:
+                with sdpa_kernel(backends):
+                    return sdpa(query, key, value, is_causal=is_causal)
+        except (ImportError, RuntimeError, TypeError):
+            torch.cuda.empty_cache()
+            pass
+
+        # Keep compatibility with older Kaggle PyTorch builds that predate
+        # torch.nn.attention.sdpa_kernel.
+        try:
+            with torch.backends.cuda.sdp_kernel(
+                enable_flash=True,
+                enable_math=False,
+                enable_mem_efficient=True,
+            ):
+                return sdpa(query, key, value, is_causal=is_causal)
+        except (RuntimeError, TypeError, AttributeError):
+            torch.cuda.empty_cache()
+            return cls._chunked_attention(query, key, value, is_causal=is_causal)
+
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         query, key, value = self.qkv(inputs).chunk(3, dim=-1)
         query, key, value = self._split(query), self._split(key), self._split(value)
-        scores = torch.matmul(query, key.transpose(-2, -1)) / (self.head_dim**0.5)
-        causal_mask = torch.triu(
-            torch.ones(inputs.shape[1], inputs.shape[1], device=inputs.device, dtype=torch.bool),
-            diagonal=1,
-        )
-        scores = scores.masked_fill(causal_mask, torch.finfo(scores.dtype).min)
-        weights = torch.softmax(scores, dim=-1)
-        return self.output(self._join(torch.matmul(weights, value)))
+        attended = self._scaled_dot_product_attention(query, key, value, is_causal=True)
+        return self.output(self._join(attended))
 
     def step(
         self,
@@ -178,9 +277,8 @@ class CausalSelfAttention(nn.Module):
         if key.shape[2] > self.context_length:
             key = key[:, :, -self.context_length :]
             value = value[:, :, -self.context_length :]
-        scores = torch.matmul(query, key.transpose(-2, -1)) / (self.head_dim**0.5)
-        weights = torch.softmax(scores, dim=-1)
-        output = self.output(self._join(torch.matmul(weights, value)))
+        attended = self._scaled_dot_product_attention(query, key, value, is_causal=False)
+        output = self.output(self._join(attended))
         return output, (key.detach(), value.detach())
 
 

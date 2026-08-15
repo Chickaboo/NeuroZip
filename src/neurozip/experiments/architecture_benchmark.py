@@ -112,11 +112,11 @@ def generate_sample(
     }
 
 
-def _base_result(artifact_dir: Path, checkpoint_path: Path) -> dict[str, Any]:
+def _base_result(artifact_dir: Path, checkpoint_path: Path | None) -> dict[str, Any]:
     result: dict[str, Any] = {
         "architecture": artifact_dir.name,
         "status": "FAILED",
-        "checkpoint": str(checkpoint_path),
+        "checkpoint": str(checkpoint_path) if checkpoint_path is not None else None,
         "exact_round_trip": False,
         "byte_identical": False,
         "sha256_identical": False,
@@ -124,11 +124,36 @@ def _base_result(artifact_dir: Path, checkpoint_path: Path) -> dict[str, Any]:
     run_config_path = artifact_dir / "run_config.json"
     summary_path = artifact_dir / "summary.json"
     if run_config_path.exists():
-        config = json.loads(run_config_path.read_text())
-        result["model_config"] = config.get("model_config")
-        result["train_config"] = config.get("train_config")
+        try:
+            config = json.loads(run_config_path.read_text())
+            result["model_config"] = config.get("model_config")
+            result["train_config"] = config.get("train_config")
+        except (OSError, json.JSONDecodeError) as exc:
+            result["metadata_failure"] = f"run_config.json: {type(exc).__name__}: {exc}"
     if summary_path.exists():
-        result.update({f"training_{key}": value for key, value in json.loads(summary_path.read_text()).items()})
+        try:
+            result.update(
+                {f"training_{key}": value for key, value in json.loads(summary_path.read_text()).items()}
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            result["metadata_failure"] = f"summary.json: {type(exc).__name__}: {exc}"
+    return result
+
+
+def _missing_checkpoint_result(artifact_dir: Path) -> dict[str, Any]:
+    """Keep an interrupted architecture visible in the final comparison."""
+
+    result = _base_result(artifact_dir, None)
+    failure_path = artifact_dir / "failure.json"
+    if failure_path.exists():
+        try:
+            failure = json.loads(failure_path.read_text())
+            result["failure_reason"] = failure.get("failure_reason", "training did not produce best.pt")
+            result["training_failure"] = failure
+        except (OSError, json.JSONDecodeError):
+            result["failure_reason"] = "training did not produce a readable best.pt checkpoint"
+    else:
+        result["failure_reason"] = "training did not produce best.pt"
     return result
 
 
@@ -423,6 +448,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cdf-bits", type=int, default=20)
     parser.add_argument("--sample-prompt", default="The ")
     parser.add_argument("--sample-length", type=int, default=96)
+    parser.add_argument(
+        "--expected-architectures",
+        nargs="*",
+        help="optional ordered architecture names; missing checkpoints are emitted as FAILED rows",
+    )
     return parser
 
 
@@ -434,25 +464,39 @@ def main(argv: list[str] | None = None) -> None:
     if not original:
         raise SystemExit("held-out input is empty")
     checkpoints = sorted(args.artifacts_root.glob("*/best.pt"))
-    if not checkpoints:
+    checkpoint_by_architecture = {checkpoint.parent.name: checkpoint for checkpoint in checkpoints}
+    if not checkpoints and not args.expected_architectures:
         raise SystemExit(f"no architecture checkpoints found under {args.artifacts_root}")
-    results = [
-        benchmark_checkpoint(
-            checkpoint,
-            original,
-            device=args.device,
-            cdf_bits=args.cdf_bits,
-            output_dir=args.output_dir,
-            sample_prompt=args.sample_prompt.encode("utf-8"),
-            sample_length=args.sample_length,
+    if args.expected_architectures:
+        ordered_names = list(dict.fromkeys(args.expected_architectures))
+        ordered_names.extend(
+            name for name in sorted(checkpoint_by_architecture) if name not in ordered_names
         )
-        for checkpoint in checkpoints
-    ]
+    else:
+        ordered_names = [checkpoint.parent.name for checkpoint in checkpoints]
+    results = []
+    for name in ordered_names:
+        checkpoint = checkpoint_by_architecture.get(name)
+        if checkpoint is None:
+            results.append(_missing_checkpoint_result(args.artifacts_root / name))
+            continue
+        results.append(
+            benchmark_checkpoint(
+                checkpoint,
+                original,
+                device=args.device,
+                cdf_bits=args.cdf_bits,
+                output_dir=args.output_dir,
+                sample_prompt=args.sample_prompt.encode("utf-8"),
+                sample_length=args.sample_length,
+            )
+        )
     report = {
         "input": str(args.input),
         "input_bytes": len(original),
         "device": args.device,
         "cdf_bits": args.cdf_bits,
+        "expected_architectures": args.expected_architectures,
         "results": results,
         "recommendation": score_results(results),
     }
