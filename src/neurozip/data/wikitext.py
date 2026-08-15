@@ -10,7 +10,13 @@ import zipfile
 from pathlib import Path
 
 
-WIKITEXT_RAW_URL = "https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-103-raw-v1.zip"
+# The original MetaMind/S3 endpoint now redirects instead of serving the
+# archive. This public mirror contains the same wikitext-103-raw-v1.zip
+# archive (sha256: 91c00ae287f0d699e18605c84afc9e45c192bc6b7797ff8837e5474655a33794).
+WIKITEXT_RAW_URL = (
+    "https://huggingface.co/datasets/mattdangerw/wikitext-103-raw/"
+    "resolve/main/wikitext-103-raw-v1.zip?download=true"
+)
 DEFAULT_TRAIN_BYTES = 50 * 1024 * 1024
 DEFAULT_VALID_BYTES = 5 * 1024 * 1024
 

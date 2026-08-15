@@ -35,8 +35,8 @@ WikiText-103 windows, and calls the repository's `neurozip.train` module. The
 run exports `best.pt`, `last.pt`, `metrics.jsonl`, `run_config.json`, and
 `summary.json` under the run artifact directory.
 
-The default preparation downloads the official WikiText-103 raw archive and
-uses deterministic 50 MiB training and 5 MiB validation windows.
+The default preparation downloads a public mirror of the WikiText-103 raw
+archive and uses deterministic 50 MiB training and 5 MiB validation windows.
 
 The trained `best.pt` can be downloaded and used locally with:
 
