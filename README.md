@@ -8,8 +8,10 @@ range coder.
 The local implementation is intentionally dependency-light. The coder, file
 format, uniform predictor, CLI, and tests run with Python's standard library.
 PyTorch is needed only for training and for compressing with a trained GRU.
-Actual model training is configured for Kaggle GPU in
+Actual model training is configured for a Kaggle GPU in
 [`notebooks/neurozip_v0_wikitext103_kaggle.ipynb`](notebooks/neurozip_v0_wikitext103_kaggle.ipynb).
+The notebook clones the public GitHub repository before running the training
+code, so no uploaded dataset copy is required.
 
 ## Local smoke test
 
@@ -27,11 +29,14 @@ host.
 
 ## Kaggle training
 
-Upload the repository as a Kaggle Dataset, attach it to a GPU notebook, and run
-the notebook. It discovers the repository under `/kaggle/input`, copies it to
-`/kaggle/working`, prepares deterministic raw WikiText-103 windows, and calls
-the repository's `neurozip.train` module. The run exports `best.pt`,
-`last.pt`, `metrics.jsonl`, `run_config.json`, and a zipped artifact bundle.
+Open the notebook in Kaggle with GPU and Internet access enabled. It clones the
+public repository into `/kaggle/working`, prepares deterministic raw
+WikiText-103 windows, and calls the repository's `neurozip.train` module. The
+run exports `best.pt`, `last.pt`, `metrics.jsonl`, `run_config.json`, and
+`summary.json` under the run artifact directory.
+
+The default preparation downloads the official WikiText-103 raw archive and
+uses deterministic 50 MiB training and 5 MiB validation windows.
 
 The trained `best.pt` can be downloaded and used locally with:
 
